@@ -5,7 +5,6 @@ on:
   push:
     branches: [DN8]
 
-
 jobs:
   build:
     runs-on: macos-latest
@@ -25,9 +24,62 @@ jobs:
               git clone --depth 1 "$2" "$1"
             fi
           }
-          fetch LibOrbisPkg   https://github.com/OpenOrbis/LibOrbisPkg
+          fetch LibOrbisPkg    https://github.com/OpenOrbis/LibOrbisPkg
           fetch HttpServerLite https://github.com/marcussacana/HttpServerLite
-          fetch DHCPServer    https://github.com/jpmikkers/DHCPServer
+          fetch DHCPServer     https://github.com/jpmikkers/DHCPServer
+
+      # The app's startup code only knows Windows, Linux, macOS and Android,
+      # so on iOS it throws an exception right after launch. These edits teach
+      # it about iOS. This step fails early if the source has changed.
+      - name: Patch app source for iOS
+        run: |
+          python3 - << 'PY'
+          import sys
+
+          def patch(path, old, new):
+              with open(path, encoding="utf-8-sig") as f:
+                  text = f.read()
+              if old not in text:
+                  print("::error::Patch target not found in " + path + ": " + old)
+                  sys.exit(1)
+              with open(path, "w", encoding="utf-8") as f:
+                  f.write(text.replace(old, new, 1))
+
+          core = "DirectPackageInstaller/DirectPackageInstaller/"
+          app = core + "App.axaml.cs"
+
+          # iOS is not Android, and behaves like an Apple platform
+          patch(app,
+                "internal static bool IsAndroid => _IsAndroid ??= SelfUpdate.MainExecutable == null;",
+                "internal static bool IsIOS => System.OperatingSystem.IsIOS();\n"
+                "        internal static bool IsAndroid => _IsAndroid ??= !IsIOS && SelfUpdate.MainExecutable == null;")
+          patch(app,
+                "internal static bool IsOSX => RuntimeInformation.IsOSPlatform(OSPlatform.OSX);",
+                "internal static bool IsOSX => RuntimeInformation.IsOSPlatform(OSPlatform.OSX) || System.OperatingSystem.IsIOS();")
+
+          # writable working folder on iOS (visible in the Files app)
+          patch(app,
+                "_WorkingDir = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);",
+                "_WorkingDir = IsIOS ? Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments) : Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);")
+
+          # crash log must go to a writable place on iOS
+          patch(app,
+                'File.WriteAllText("DPI-CRASH.log", ErrorInfo);',
+                'File.WriteAllText(IsIOS ? Path.Combine(WorkingDirectory, "DPI-CRASH.log") : "DPI-CRASH.log", ErrorInfo);')
+
+          # no self-update logic on iOS
+          patch(core + "SelfUpdate.cs",
+                "var MainAssembly = System.Reflection.Assembly.GetEntryAssembly()?.Location;",
+                "if (System.OperatingSystem.IsIOS())\n"
+                "                        return null;\n\n"
+                "                    var MainAssembly = System.Reflection.Assembly.GetEntryAssembly()?.Location;")
+
+          # launch screen text left over from the Avalonia template
+          patch("DirectPackageInstaller/DirectPackageInstaller.iOS/Resources/LaunchScreen.xib",
+                "ControlCatalog.iOS", "DirectPackageInstaller")
+
+          print("All source patches applied.")
+          PY
 
       - uses: actions/setup-dotnet@v4
         with:
@@ -38,7 +90,6 @@ jobs:
 
       # The iOS head project in the repo is a simulator-only stub on .NET 6
       # and the Avalonia version in Directory.Build.props is stale.
-      # Replace them with working device settings.
       - name: Patch iOS project
         run: |
           cd DirectPackageInstaller
@@ -74,6 +125,43 @@ jobs:
           </Project>
           XML
 
+          # Entry point that writes any startup crash to Documents/DPI-IOS-CRASH.log
+          cat > DirectPackageInstaller.iOS/Main.cs << 'CS'
+          using System;
+          using System.IO;
+          using UIKit;
+
+          namespace DirectPackageInstaller.iOS
+          {
+              public class Application
+              {
+                  static void Log(string text)
+                  {
+                      try
+                      {
+                          var dir = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
+                          File.AppendAllText(Path.Combine(dir, "DPI-IOS-CRASH.log"), DateTime.Now + "\n" + text + "\n\n");
+                      }
+                      catch { }
+                  }
+
+                  static void Main(string[] args)
+                  {
+                      AppDomain.CurrentDomain.UnhandledException += (s, e) => Log(e.ExceptionObject.ToString());
+                      try
+                      {
+                          UIApplication.Main(args, null, typeof(AppDelegate));
+                      }
+                      catch (Exception ex)
+                      {
+                          Log(ex.ToString());
+                          throw;
+                      }
+                  }
+              }
+          }
+          CS
+
           cat > DirectPackageInstaller.iOS/Info.plist << 'XML'
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -91,6 +179,12 @@ jobs:
             <true/>
             <key>MinimumOSVersion</key>
             <string>13.0</string>
+            <key>UIFileSharingEnabled</key>
+            <true/>
+            <key>LSSupportsOpeningDocumentsInPlace</key>
+            <true/>
+            <key>NSLocalNetworkUsageDescription</key>
+            <string>Needed to find and talk to your console on the local network.</string>
             <key>UIDeviceFamily</key>
             <array>
               <integer>1</integer>
