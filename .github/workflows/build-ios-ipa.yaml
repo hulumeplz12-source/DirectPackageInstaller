@@ -1,0 +1,144 @@
+name: Build unsigned iOS IPA
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # Covers the case where the repo was created from the source zip,
+      # which has empty submodule folders.
+      - name: Fetch submodules if missing
+        run: |
+          fetch() {
+            if [ -z "$(ls -A "$1" 2>/dev/null)" ]; then
+              rm -rf "$1"
+              git clone --depth 1 "$2" "$1"
+            fi
+          }
+          fetch LibOrbisPkg   https://github.com/OpenOrbis/LibOrbisPkg
+          fetch HttpServerLite https://github.com/marcussacana/HttpServerLite
+          fetch DHCPServer    https://github.com/jpmikkers/DHCPServer
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Install iOS workload
+        run: dotnet workload install ios
+
+      # The iOS head project in the repo is a simulator-only stub on .NET 6
+      # and the Avalonia version in Directory.Build.props is stale.
+      # Replace them with working device settings.
+      - name: Patch iOS project
+        run: |
+          cd DirectPackageInstaller
+
+          cat > Directory.Build.props << 'XML'
+          <Project>
+            <PropertyGroup>
+              <AvaloniaVersion>11.3.8</AvaloniaVersion>
+            </PropertyGroup>
+          </Project>
+          XML
+
+          cat > DirectPackageInstaller.iOS/DirectPackageInstaller.iOS.csproj << 'XML'
+          <Project Sdk="Microsoft.NET.Sdk">
+            <PropertyGroup>
+              <OutputType>Exe</OutputType>
+              <TargetFramework>net8.0-ios</TargetFramework>
+              <SupportedOSPlatformVersion>13.0</SupportedOSPlatformVersion>
+              <RuntimeIdentifier>ios-arm64</RuntimeIdentifier>
+              <Nullable>enable</Nullable>
+              <ProvisioningType>manual</ProvisioningType>
+              <EnableCodeSigning>false</EnableCodeSigning>
+              <ValidateXcodeVersion>false</ValidateXcodeVersion>
+              <MtouchLink>None</MtouchLink>
+              <NullabilityInfoContextSupport>true</NullabilityInfoContextSupport>
+            </PropertyGroup>
+            <ItemGroup>
+              <PackageReference Include="Avalonia.iOS" Version="11.3.8" />
+            </ItemGroup>
+            <ItemGroup>
+              <ProjectReference Include="..\DirectPackageInstaller\DirectPackageInstaller.csproj" />
+            </ItemGroup>
+          </Project>
+          XML
+
+          cat > DirectPackageInstaller.iOS/Info.plist << 'XML'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleDisplayName</key>
+            <string>DirectPackageInstaller</string>
+            <key>CFBundleIdentifier</key>
+            <string>com.example.DirectPackageInstaller</string>
+            <key>CFBundleShortVersionString</key>
+            <string>1.0</string>
+            <key>CFBundleVersion</key>
+            <string>1.0</string>
+            <key>LSRequiresIPhoneOS</key>
+            <true/>
+            <key>MinimumOSVersion</key>
+            <string>13.0</string>
+            <key>UIDeviceFamily</key>
+            <array>
+              <integer>1</integer>
+              <integer>2</integer>
+            </array>
+            <key>UILaunchStoryboardName</key>
+            <string>LaunchScreen</string>
+            <key>UIRequiredDeviceCapabilities</key>
+            <array>
+              <string>arm64</string>
+            </array>
+            <key>UISupportedInterfaceOrientations</key>
+            <array>
+              <string>UIInterfaceOrientationPortrait</string>
+              <string>UIInterfaceOrientationLandscapeLeft</string>
+              <string>UIInterfaceOrientationLandscapeRight</string>
+            </array>
+            <key>UISupportedInterfaceOrientations~ipad</key>
+            <array>
+              <string>UIInterfaceOrientationPortrait</string>
+              <string>UIInterfaceOrientationPortraitUpsideDown</string>
+              <string>UIInterfaceOrientationLandscapeLeft</string>
+              <string>UIInterfaceOrientationLandscapeRight</string>
+            </array>
+            <key>UIStatusBarHidden</key>
+            <true/>
+            <key>UIViewControllerBasedStatusBarAppearance</key>
+            <false/>
+          </dict>
+          </plist>
+          XML
+
+      - name: Build (unsigned, device)
+        run: |
+          dotnet build DirectPackageInstaller/DirectPackageInstaller.iOS/DirectPackageInstaller.iOS.csproj \
+            -c Release -r ios-arm64 \
+            -p:EnableCodeSigning=false \
+            -p:ValidateXcodeVersion=false
+
+      - name: Package IPA
+        run: |
+          APP=$(find DirectPackageInstaller/DirectPackageInstaller.iOS/bin -maxdepth 6 -type d -name '*.app' | head -n 1)
+          echo "Found app bundle: $APP"
+          test -n "$APP"
+          mkdir -p out/Payload
+          cp -R "$APP" out/Payload/
+          cd out
+          zip -qry DirectPackageInstaller-unsigned.ipa Payload
+          ls -lh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DirectPackageInstaller-unsigned-ipa
+          path: out/DirectPackageInstaller-unsigned.ipa
